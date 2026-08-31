@@ -3,6 +3,35 @@
 All notable changes to **dsh-remote**.
 
 ## 0.8.10 — 2026-08-31
+### 修复：DSH 0.7 升级后启动崩溃 —— client `apply()` 直接属性读取未注入的 `workspaces` 服务
+
+**报错**：`Error: failed to apply loader entry b6b03bef (dsh-remote): cannot get property "workspaces" without inject`
+
+- **根因**：旧代码 `lib/client.js` 的 `apply()` 用
+  `ctx.get('workspaces') || ctx.workspaces` 读取可选的 `workspaces` 服务。DSH 0.7.x 的 Web 客户端
+  （client-modules + cordis v4 架构）有两个变化让这行在启动时抛错：
+  1. 客户端 `workspaces` 服务改由**兄弟 loader entry**（`@deepseek-ai/dsh-api-workspace-controller`）
+     提供，而不是本 entry fiber 的祖先；本 entry 的 `apply()` 运行时，若提供方 fiber 尚未 ACTIVE，
+     `ctx.get('workspaces')` 按契约返回 `undefined`（strict 查询，不抛错）；
+  2. cordis v4 的上下文代理对**无法解析的属性直接访问会抛
+     `cannot get property "X" without inject`**（旧版 cordis 返回 `undefined`）——
+     `|| ctx.workspaces` 兜底因此在 boot 时抛错，整个 `dsh-remote` loader entry 应用失败，
+     DSH 报出上述 `failed to apply loader entry` 错误。
+- **修复**：移除已成死代码的 `WORKSPACES` 变量及其赋值——该变量全仓库无任何读取点：本机文件夹选择
+  早已改走宿主端 `/dsh-remote/local-pick`（DSH `directoryPicker` 服务；browse 后端回退内置本机
+  浏览浮层），并不依赖客户端 `workspaces` 服务。文件头注释（旧称 `ctx.workspaces.pickDirectory`）
+  同步改为真实机制。
+- **顺带加固**：`if (slots === undefined) return` → `if (!slots) return`——slots 服务即使为
+  `null` 也不会再落到 `slots.inject` 抛 TypeError。
+- **回归测试**：新增 `test/client-apply.test.js` —— 用 Proxy 精确模拟 cordis v4 上下文契约
+  （任意未提供属性访问即抛同款错误、`ctx.get` 返回 undefined），驱动真实 client `apply()`，
+  断言不崩溃且 settings.section / directoryFlow / betterSidebar 注册全部完成；对旧代码运行该测试
+  恰在 `ctx.workspaces` 访问点（`lib/client.js:1470`）如报失败。
+- **说明**：`package.json` 的 `dsh.client.inject` 仍保留 `@deepseek-ai/dsh-client-runtime`
+  （旧架构包，0.7.x 已不存在）——新版 client-modules 对未知 inject 名**静默跳过**（仅参与 bundle
+  到达排序，不报错），保留它是为了与旧版 DSH 的注入语义兼容，故未改动。
+
+
 ### 修复：`rw_upload` 自引入即坏 —— `sftp.fastPut` 参数顺序颠倒（ssh2 契约为 `fastPut(本地, 远程)`）
 
 - **根因**：`rw_upload` 调用的是 `sftp.fastPut(rp, lp)`，把**远程路径当本地路径**传给了
