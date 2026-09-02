@@ -4,7 +4,7 @@ dist/
 .DS_Store
 .npmrc
 
-dev-harness/
+dev-harness*/
 pnpm-lock.yaml
 pnpm-workspace.yaml
 
