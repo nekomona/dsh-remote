@@ -17,7 +17,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { MemFs, makeSftp, seed } from './helpers.js'
@@ -530,4 +530,164 @@ test('system-prompt section: bound context / legacy mirror cwd / local cwd', asy
 
   // 4) no agent at all → silent
   assert.equal(h.sectionText({}), '')
+})
+
+// ── k. review hardening pins (spec §12.5 / §13, review round 1) ─────────────
+
+/** Seed machines.json BEFORE apply() so the real registry load sees it. */
+function seedRegistry(home, obj) {
+  const rw = path.join(home, 'remote-workspaces')
+  mkdirSync(rw, { recursive: true })
+  writeFileSync(path.join(rw, 'machines.json'), JSON.stringify(obj, null, 2), 'utf8')
+  return rw
+}
+
+test('F4: rw_connect save:true never flips the registry currentId (host + machineId forms)', async (t) => {
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-harness-f4-'))
+  t.after(() => { try { rmSync(home, { recursive: true, force: true }) } catch {} })
+  const rw = seedRegistry(home, {
+    version: 1,
+    currentId: 'm-seed',
+    list: [{ id: 'm-seed', name: 'seed', host: 'h-seed', port: 22, username: 'useed', password: 'pwseed' }],
+  })
+  const h = await startHarness(t, {}, home)
+  const readCurrent = () => {
+    const j = JSON.parse(readFileSync(path.join(rw, 'machines.json'), 'utf8'))
+    return j.currentId === undefined ? null : j.currentId
+  }
+  assert.equal(readCurrent(), 'm-seed', 'seeded currentId is live before any connect')
+
+  // host form: upserts a NEW machine — currentId must stay on m-seed
+  const A = 'session-f4'
+  await h.call('rw_connect', { host: 'h-new', username: 'unew', password: 'pwn' }, A)
+  assert.equal(readCurrent(), 'm-seed', 'currentId unchanged after host-form save:true')
+  const ctxs1 = JSON.parse(readFileSync(path.join(rw, 'contexts.json'), 'utf8'))
+  assert.ok(ctxs1.contexts[A] && ctxs1.contexts[A].machineId, 'calling context gained a machineId binding')
+  assert.notEqual(ctxs1.contexts[A].machineId, 'm-seed', 'host form upserted a distinct machine')
+
+  // machineId form: binds an EXISTING machine — currentId still unchanged
+  const B = 'session-f4b'
+  await h.call('rw_connect', { machineId: 'm-seed', save: true }, B)
+  assert.equal(readCurrent(), 'm-seed', 'currentId unchanged after machineId-form save:true')
+  const ctxs2 = JSON.parse(readFileSync(path.join(rw, 'contexts.json'), 'utf8'))
+  assert.equal(ctxs2.contexts[B].machineId, 'm-seed', 'calling context bound to the referenced machine')
+})
+
+test('/current legacy pair: binds __global__, persists legacy workspace, explicitNone clears inert', async (t) => {
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-harness-cur-'))
+  t.after(() => { try { rmSync(home, { recursive: true, force: true }) } catch {} })
+  const rw = seedRegistry(home, {
+    version: 1,
+    list: [{ id: 'm-legacy', name: 'legacy', host: 'h-legacy', port: 22, username: 'ulegacy', password: 'pwleg' }],
+  })
+  // A config-level default host: __global__ would otherwise bootstrap from it,
+  // which is exactly what an explicit "active remote = none" must override.
+  const h = await startHarness(t, { host: 'cfg-host', port: 2222, username: 'cfguser' }, home)
+  const legacy = () => JSON.parse(readFileSync(path.join(rw, 'machines.json'), 'utf8')).list.find((m) => m.id === 'm-legacy')
+
+  // 0) regression guard (a): fresh global with a config default and NO explicit
+  // choice → the bootstrap display is intact (host + activeSource 'config')
+  const g0 = (await h.route('/dsh-remote/status', 'GET')).json
+  assert.equal(g0.host, 'cfg-host', 'bootstrap display: config host intact without an explicit clear')
+  assert.equal(g0.activeSource, 'config', 'bootstrap display: activeSource is config')
+
+  // 1) POST /current {id} → __global__ gains machineId in contexts.json
+  const cur = await h.route('/dsh-remote/current', 'POST', { body: { id: 'm-legacy' } })
+  assert.equal(cur.status, 200)
+  assert.equal(cur.json.ok, true)
+  assert.equal(cur.json.machineId, 'm-legacy', '/current binds the global context')
+  const ctxs = JSON.parse(readFileSync(path.join(rw, 'contexts.json'), 'utf8'))
+  assert.equal(ctxs.contexts['__global__'].machineId, 'm-legacy', '__global__ binding persisted in contexts.json')
+
+  // Materialize the global pool (lazy by design) and seed its in-memory fs so
+  // /workspace's isRemoteDir (sftp.stat) can confirm the candidate directories.
+  await h.call('rw_exec', { command: 'ls' }, undefined)
+  const gpool = h.factory.pools[h.factory.pools.length - 1]
+  assert.equal(gpool.targets[0].host, 'h-legacy', 'global pool targets the bound machine')
+  gpool.fs.mkdirSync('/proj')
+  gpool.fs.mkdirSync('/proj2')
+
+  // 2) agentless POST /workspace → machines.json rec.workspace + recentWorkspaces
+  const ws1 = await h.route('/dsh-remote/workspace', 'POST', { body: { path: '/proj' } })
+  assert.equal(ws1.status, 200)
+  assert.equal(ws1.json.ok, true)
+  assert.equal(legacy().workspace, '/proj', 'machine record gained the legacy workspace')
+  assert.deepEqual(legacy().recentWorkspaces, ['/proj'], 'first pick recorded')
+  // repeat pick → dedupe (no duplicate entry, no extra churn)
+  await h.route('/dsh-remote/workspace', 'POST', { body: { path: '/proj' } })
+  assert.deepEqual(legacy().recentWorkspaces, ['/proj'], 'repeat pick dedupes')
+  // a second workspace → prepended, first kept
+  const ws3 = await h.route('/dsh-remote/workspace', 'POST', { body: { path: '/proj2' } })
+  assert.equal(ws3.status, 200)
+  assert.deepEqual(legacy().recentWorkspaces, ['/proj2', '/proj'], 'second pick prepended')
+  assert.equal(legacy().workspace, '/proj2', 'machine record tracks the latest pick')
+
+  // 3) POST /current {id:''} → registry currentId null + __global__ inert
+  const clear = await h.route('/dsh-remote/current', 'POST', { body: { id: '' } })
+  assert.equal(clear.status, 200)
+  assert.equal(clear.json.ok, true)
+  const mach = JSON.parse(readFileSync(path.join(rw, 'machines.json'), 'utf8'))
+  assert.equal(mach.currentId === undefined ? null : mach.currentId, null, 'registry currentId is null after explicit clear')
+  const g = (await h.route('/dsh-remote/status', 'GET')).json
+  assert.equal(g.contextId, '__global__')
+  assert.equal(g.machineId, null, 'no binding after explicit clear')
+  assert.equal(g.connected, false, 'no live pool after explicit clear')
+  assert.equal(g.sessionMode, 'local', 'explicitNone: the global context is local, not config-bootstrapped')
+  assert.equal(g.host, '', 'explicitNone: the config default host must not be reported as the context host')
+  assert.equal(g.port, 22, 'explicitNone: inert default port, not the config default')
+  assert.equal(g.username, '', 'explicitNone: the config default username must not be reported')
+  assert.equal(g.activeSource, 'none', 'explicitNone: no active source (must not be "config")')
+})
+
+test('F6+hostKeyMode: save:false machineId connect carries proxy/useAgent/kbd/hostKeyMode; parity with web /connect', async (t) => {
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-harness-f6-'))
+  t.after(() => { try { rmSync(home, { recursive: true, force: true }) } catch {} })
+  seedRegistry(home, {
+    version: 1,
+    list: [
+      {
+        id: 'm-rich', name: 'rich', host: 'h-rich', port: 22, username: 'urich', password: 'pwr',
+        proxy: { host: 'jump.example', port: 2222, username: 'juser', password: 'jpw' },
+        useAgent: true, keyboardInteractive: true, hostKeyMode: 'verify',
+      },
+      { id: 'm-plain', name: 'plain', host: 'h-plain', port: 22, username: 'uplain', password: 'pwpl' },
+    ],
+  })
+  const h = await startHarness(t, {}, home)
+
+  // tool path: rw_connect {machineId, save:false} on the rich machine
+  const before = h.factory.pools.length
+  await h.call('rw_connect', { machineId: 'm-rich', save: false }, 'session-f6')
+  assert.equal(h.factory.pools.length, before + 1, 'tool connect materialized a pool')
+  const tt = h.factory.pools[before].targets[0]
+  assert.ok(tt, 'tool pool received setTarget')
+  assert.equal(tt.host, 'h-rich')
+  assert.equal(tt.username, 'urich')
+  assert.equal(tt.password, 'pwr', 'machinePassword-resolved plain password reached setTarget')
+  assert.equal(tt.proxy && tt.proxy.host, 'jump.example', 'proxy carried from the registry machine')
+  assert.equal(tt.proxy && tt.proxy.port, 2222)
+  assert.equal(tt.useAgent, true, 'useAgent carried')
+  assert.equal(tt.keyboardInteractive, true, 'keyboardInteractive carried')
+  assert.equal(tt.hostKeyMode, 'verify', 'hostKeyMode carried (no silent downgrade)')
+
+  // web path: POST /connect {machineId} for a DIFFERENT session — strict parity
+  const w = await h.route('/dsh-remote/connect', 'POST', { body: { machineId: 'm-rich', sessionId: 'web-f6' } })
+  assert.equal(w.status, 200)
+  assert.equal(w.json.ok, true, 'web /connect ok')
+  const wt = h.factory.pools[h.factory.pools.length - 1].targets[0]
+  for (const k of ['proxy', 'useAgent', 'keyboardInteractive', 'hostKeyMode', 'password']) {
+    assert.deepEqual(wt[k], tt[k], `web /connect setTarget ${k} strictly equals the tool save:false value`)
+  }
+
+  // control: machine WITHOUT the fields → all four undefined in setTarget
+  // (resolvePool falls back to the config defaults, as before)
+  const before2 = h.factory.pools.length
+  await h.call('rw_connect', { machineId: 'm-plain', save: false }, 'session-f6b')
+  assert.equal(h.factory.pools.length, before2 + 1)
+  const ct = h.factory.pools[before2].targets[0]
+  assert.equal(ct.host, 'h-plain')
+  assert.equal(ct.password, 'pwpl')
+  for (const k of ['proxy', 'useAgent', 'keyboardInteractive', 'hostKeyMode']) {
+    assert.equal(ct[k], undefined, `control machine: ${k} left undefined → config default`)
+  }
 })

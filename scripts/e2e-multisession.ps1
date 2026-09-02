@@ -18,6 +18,12 @@
 #   4. disconnect s1 (POST /connect {action:'disconnect', sessionId}) -> s1
 #      connected=false, s2 STILL connected (per-context disconnect)
 #   5. fresh e2e-fresh -> /status connected=false, no machineId (no inheritance)
+#   6. sessionMode (spec 12.5): bound sessions report 'remote' (sessionRemotePath
+#      empty for synthetic ids), fresh session reports 'local'
+#   7. legacy no-sessionId /status -> __global__ connected:false sessionMode:'local'
+#      while s1/s2 stay connected (global unaffected by bound sessions)
+#   8. raw contexts.json: no 'password'/'passphrase' key, and no server-b
+#      plain-password string (credential guarantee proven E2E, not only in unit)
 #
 # The sandbox's machines.json is a COPY of the product registry with
 # currentId blanked (NOTE printed) so the global auto-restore never probes an
@@ -271,12 +277,14 @@ try {
     Write-Host ("         (s1 /tmp has {0} entries)" -f @($r.items).Count)
     return $r
   }
-  $st1 = Check 's1 status: connected, 127.0.0.1:12922, ws /tmp (after pool use)' {
+  $st1 = Check 's1 status: connected, 127.0.0.1:12922, ws /tmp, sessionMode remote (after pool use)' {
     $r = & $getJson '/dsh-remote/status?sessionId=e2e-s1'
     if ($r.connected -ne $true) { throw "not connected: $($r | ConvertTo-Json -Compress -Depth 2)" }
     if ($r.host -ne '127.0.0.1') { throw "wrong host: $($r.host)" }
     if ($r.port -ne 12922) { throw "wrong port: $($r.port)" }
     if ($r.workspace -ne '/tmp') { throw "wrong workspace: $($r.workspace)" }
+    if ($r.sessionMode -cne 'remote') { throw "sessionMode expected 'remote', got '$($r.sessionMode)'" }
+    if ("$($r.sessionRemotePath)" -ne '') { throw "sessionRemotePath expected empty (no local-cwd mirror for a synthetic session), got '$($r.sessionRemotePath)'" }
     return $r
   }
 
@@ -316,12 +324,14 @@ try {
     }
   }
 
-  $st2 = Check ("s2 status: connected, {0}:{1}, ws {2} (after pool use)" -f $s2host, $s2port, $s2ws) {
+  $st2 = Check ("s2 status: connected, {0}:{1}, ws {2}, sessionMode remote (after pool use)" -f $s2host, $s2port, $s2ws) {
     $r = & $getJson '/dsh-remote/status?sessionId=e2e-s2'
     if ($r.connected -ne $true) { throw "not connected: $($r | ConvertTo-Json -Compress -Depth 2)" }
     if ($r.host -ne $s2host) { throw "wrong host: $($r.host)" }
     if ($r.port -ne $s2port) { throw "wrong port: $($r.port)" }
     if ($r.workspace -ne $s2ws) { throw "wrong workspace: $($r.workspace)" }
+    if ($r.sessionMode -cne 'remote') { throw "sessionMode expected 'remote', got '$($r.sessionMode)'" }
+    if ("$($r.sessionRemotePath)" -ne '') { throw "sessionRemotePath expected empty (no local-cwd mirror for a synthetic session), got '$($r.sessionRemotePath)'" }
     return $r
   }
 
@@ -334,6 +344,41 @@ try {
       throw 'both sessions point at the identical host:port + workspace'
     }
     return $true
+  }
+
+  # ── spec 12.5: legacy no-sessionId probe + raw credential inspection ───────
+  Check 'legacy /status (no sessionId): __global__ connected:false sessionMode:local; s1+s2 still connected' {
+    $r = & $getJson '/dsh-remote/status'
+    if ($r.contextId -cne '__global__') { throw "expected __global__ context, got '$($r.contextId)'" }
+    if ($r.connected -ne $false) { throw 'global context unexpectedly connected' }
+    if ($r.sessionMode -cne 'local') { throw "global sessionMode expected 'local', got '$($r.sessionMode)'" }
+    $a = & $getJson '/dsh-remote/status?sessionId=e2e-s1'
+    $b = & $getJson '/dsh-remote/status?sessionId=e2e-s2'
+    if ($a.connected -ne $true) { throw 'e2e-s1 no longer connected' }
+    if ($b.connected -ne $true) { throw 'e2e-s2 no longer connected' }
+    return $r
+  }
+  Check 'raw contexts.json: s1+s2 entries, no password/passphrase key, no server-b plain-password string' {
+    $ctxFile = Join-Path $rwRoot 'contexts.json'
+    if (-not (Test-Path $ctxFile)) { throw "missing $ctxFile" }
+    $raw = Get-Content $ctxFile -Raw
+    $j = $raw | ConvertFrom-Json
+    if ($j.contexts.PSObject.Properties.Name -notcontains 'e2e-s1') { throw 'e2e-s1 entry missing' }
+    if ($j.contexts.PSObject.Properties.Name -notcontains 'e2e-s2') { throw 'e2e-s2 entry missing' }
+    if (-not $j.contexts.'e2e-s1'.machineId) { throw 'e2e-s1 entry has no machineId' }
+    if (-not $j.contexts.'e2e-s1'.workspace) { throw 'e2e-s1 entry has no workspace' }
+    $credKeys = Select-String -Path $ctxFile -Pattern '"(password|passphrase)"'
+    if ($credKeys) { throw ("credential key present in contexts.json: " + (($credKeys | ForEach-Object { $_.Line.Trim() }) -join '; ')) }
+    $sandMach = Get-Content (Join-Path $rwRoot 'machines.json') -Raw | ConvertFrom-Json
+    $serverBPw = ($sandMach.list | Where-Object { $_.id -eq 'm-mtgxru10-rfof' }).password
+    if ($serverBPw) {
+      $leak = Select-String -Path $ctxFile -Pattern $serverBPw -SimpleMatch
+      if ($leak) { throw 'server-b plain-password string leaked into contexts.json' }
+      Write-Host '         (server-b plain password verified absent from contexts.json)'
+    } else {
+      Write-Host '         (NOTE: server-b has no plain password in the sandbox registry; string check skipped, key check applied)'
+    }
+    return $raw
   }
 
   # ── disconnect independence ────────────────────────────────────────────────
@@ -359,10 +404,12 @@ try {
 
   # ── fresh session: no inheritance ─────────────────────────────────────────
   Write-Host ''
-  Check 'fresh e2e-fresh: unbound, no machine, not connected' {
+  Check 'fresh e2e-fresh: unbound, no machine, not connected, sessionMode local' {
     $r = & $getJson '/dsh-remote/status?sessionId=e2e-fresh'
     if ($r.connected -ne $false) { throw "fresh session unexpectedly connected: $($r | ConvertTo-Json -Compress -Depth 4)" }
     if ($r.machineId) { throw "fresh session inherited a machine: $($r.machineId)" }
+    if ($r.sessionMode -cne 'local') { throw "fresh sessionMode expected 'local', got '$($r.sessionMode)'" }
+    if ("$($r.sessionRemotePath)" -ne '') { throw "fresh sessionRemotePath expected empty, got '$($r.sessionRemotePath)'" }
     return $r
   }
 
